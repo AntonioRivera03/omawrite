@@ -48,6 +48,7 @@ public:
     static QList<Span> codeSpans(const QString &text);
     static int openingFenceLength(const QString &text);
     static bool isThematicBreak(const QString &text);
+    static int listMarkerLength(const QString &text);
     static bool closesFence(const QString &text, int openingLength,
                             QChar marker = QLatin1Char('`'));
 

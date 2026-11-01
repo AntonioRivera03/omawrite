@@ -385,15 +385,20 @@ void MarkdownHighlighter::highlightMarkers(const QString &text) {
 
     if (firstChar == QLatin1Char('-') || firstChar == QLatin1Char('+')
             || firstChar == QLatin1Char('*') || firstChar.isDigit()) {
-        static const QRegularExpression listRe(
-            QStringLiteral("^(\\s*(?:[-+*]|\\d+[.)])\\s+)(.*)$"));
-        const QRegularExpressionMatch list = listRe.match(text);
-        if (list.hasMatch())
-            setFormat(0, list.capturedLength(1), m_markerFormat);
+        if (const int marker = listMarkerLength(text))
+            setFormat(0, marker, m_markerFormat);
     }
 
     if (isThematicBreak(text))
         setFormat(0, text.length(), m_markerFormat);
+}
+
+// The indent, marker and spacing that open a list item, or 0 when the line is
+// not one: "  - item" opens with 4.
+int MarkdownHighlighter::listMarkerLength(const QString &text) {
+    static const QRegularExpression listRe(QStringLiteral("^\\s*(?:[-+*]|\\d+[.)])\\s+"));
+    const QRegularExpressionMatch list = listRe.match(text);
+    return list.hasMatch() ? int(list.capturedLength()) : 0;
 }
 
 // A line of three or more -, * or _ (spaces allowed between) is a rule, not

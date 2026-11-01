@@ -919,6 +919,31 @@ ApplicationWindow {
                     return true;
                 }
 
+                // Plain typing cannot share an undo step with a list hang, so
+                // a key that changes a list marker goes in as an edit.
+                // Shift+Delete is Cut, which does nothing without a selection.
+                function typeListMarker(event) {
+                    var deleting = event.key === Qt.Key_Backspace || event.key === Qt.Key_Delete;
+                    if (selectionStart !== selectionEnd
+                            || (deleting && (event.modifiers & Qt.ShiftModifier)))
+                        return false;
+                    var start = cursorPosition;
+                    var end = cursorPosition;
+                    var typed = "";
+                    if (event.key === Qt.Key_Backspace)
+                        start = Math.max(0, start - 1);
+                    else if (event.key === Qt.Key_Delete)
+                        end = Math.min(length, end + 1);
+                    else if (event.key === Qt.Key_Tab || /^[^\x00-\x1f\x7f]+$/.test(event.text))
+                        typed = event.text;
+                    else
+                        return false;
+                    if (!backend.changesListMarker(start, end, typed))
+                        return false;
+                    EditorMutations.replaceRange(editor, start, end, typed);
+                    return true;
+                }
+
                 Keys.priority: Keys.BeforeItem
                 Keys.onPressed: function(event) {
                     var pasteKey = (event.key === Qt.Key_V)
@@ -965,6 +990,8 @@ ApplicationWindow {
                                && (event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp)) {
                         movePage(event.key === Qt.Key_PageDown ? 1 : -1,
                                  event.modifiers & Qt.ShiftModifier);
+                        event.accepted = true;
+                    } else if (!commandModifier && typeListMarker(event)) {
                         event.accepted = true;
                     }
                 }

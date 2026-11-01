@@ -97,6 +97,7 @@ public:
     Q_INVOKABLE QVariantList searchMatches(const QString &query) const;
     Q_INVOKABLE void replaceRange(int start, int end, const QString &text);
     Q_INVOKABLE bool insideFence(int position) const;
+    Q_INVOKABLE bool changesListMarker(int start, int end, const QString &text) const;
     Q_INVOKABLE QVariantMap windowGeometry() const;
     Q_INVOKABLE void saveWindowGeometry(int x, int y, int width, int height, bool maximized);
     Q_INVOKABLE void documentFontChanged();
@@ -133,6 +134,7 @@ private:
     void scheduleWordCount();
     void applyDocumentTypography();
     void reapplyTypographyToChange();
+    void typesetBlocks(int start, int end);
     void scheduleRecovery();
     void writeRecovery();
     void scheduleAutoSave();
@@ -161,6 +163,8 @@ private:
     qreal m_textZoom = 1.0;
     bool m_loading = false;
     bool m_formattingTypography = false;
+    // The font changed while redo was possible; remeasure at the next edit.
+    bool m_typographyStale = false;
     int m_lastChangePos = 0;
     int m_lastChangeAdded = 0;
     QTimer m_wordCountTimer;

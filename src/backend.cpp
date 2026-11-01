@@ -9,6 +9,7 @@
 #include <QFileInfo>
 #include <QFont>
 #include <QFontDatabase>
+#include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QMimeData>
 #include <QProcess>
@@ -39,11 +40,33 @@
 #include "markdownhighlighter.h"
 
 constexpr qreal typoraLineHeightPercent = 140;
+constexpr int maxHangCharacters = 24;
 
-static QTextBlockFormat lineHeightFormat() {
+// The line height every block shares and, for a list item, a hanging indent so
+// its wrapped lines start under its text. Fenced code is not told apart, or a
+// fence opening or closing would restyle every line after it.
+static QTextBlockFormat typographyFormat(const QTextBlock &block) {
     QTextBlockFormat format;
     format.setLineHeight(typoraLineHeightPercent, QTextBlockFormat::ProportionalHeight);
+    const QTextDocument *document = block.document();
+    const QString text = block.text();
+    const QFontMetricsF metrics(document->defaultFont());
+    // Capped, or a deeply nested item would have no room to wrap.
+    const qreal hang = qBound(
+        0.0,
+        metrics.horizontalAdvance(text.left(MarkdownHighlighter::listMarkerLength(text)),
+                                  document->defaultTextOption()),
+        metrics.averageCharWidth() * maxHangCharacters);
+    format.setLeftMargin(hang);
+    format.setTextIndent(-hang);
     return format;
+}
+
+static bool hasTypography(const QTextBlockFormat &format, const QTextBlockFormat &typography) {
+    return format.lineHeightType() == typography.lineHeightType()
+        && format.lineHeight() == typography.lineHeight()
+        && format.leftMargin() == typography.leftMargin()
+        && format.textIndent() == typography.textIndent();
 }
 const QString lastSaveDirectorySetting = QStringLiteral("file/lastSaveDirectory");
 const QString textZoomSetting = QStringLiteral("text/zoom");
@@ -720,6 +743,22 @@ bool Backend::insideFence(int position) const {
     return opensOrContinues;
 }
 
+// Whether replacing start to end with text changes the line's list marker. An
+// edit that would split a surrogate pair is left to the editor.
+bool Backend::changesListMarker(int start, int end, const QString &text) const {
+    if (!m_document)
+        return false;
+    const QTextBlock block = m_document->findBlock(start);
+    if (!block.contains(end))
+        return false;
+    const QString line = block.text();
+    const QString edited = line.left(start - block.position()) + text
+        + line.mid(end - block.position());
+    return edited.isValidUtf16()
+        && line.left(MarkdownHighlighter::listMarkerLength(line))
+               != edited.left(MarkdownHighlighter::listMarkerLength(edited));
+}
+
 QVariantMap Backend::windowGeometry() const {
     QSettings settings;
     return {{QStringLiteral("x"), settings.value(QStringLiteral("window/x"), -1)},
@@ -791,6 +830,10 @@ QStringList Backend::selectableFontFamilies(const QStringList &families) {
 void Backend::documentFontChanged() {
     if (m_highlighter)
         m_highlighter->refreshFont();
+
+    // List hangs are measured in the font, so every line is measured again.
+    m_typographyStale = true;
+    reapplyTypographyToChange();
 }
 
 void Backend::loadDocumentText(const QString &text) {
@@ -1288,49 +1331,53 @@ void Backend::applyDocumentTypography() {
     // safe to drop undo history here (re-enabling clears the stack anyway).
     const bool undoEnabled = m_document->isUndoRedoEnabled();
     m_document->setUndoRedoEnabled(false);
-
-    m_formattingTypography = true;
-    QTextCursor cursor(m_document);
-    cursor.select(QTextCursor::Document);
-    cursor.mergeBlockFormat(lineHeightFormat());
-    m_formattingTypography = false;
-
+    typesetBlocks(0, m_document->characterCount() - 1);
     m_document->setUndoRedoEnabled(undoEnabled);
+    m_typographyStale = false;
 }
 
 void Backend::reapplyTypographyToChange() {
-    if (!m_document)
+    // An undo brings the formatting back with the text, and formatting now
+    // would push a command that clears the redo stack.
+    if (!m_document || m_document->isRedoAvailable())
         return;
 
     // Format only the block(s) touched by the last edit instead of the whole
-    // document, and fold the change into the preceding edit command so a single
-    // undo reverts both the text and its formatting.
+    // document, unless the font changed since the last pass.
     const int maxPos = m_document->characterCount() - 1;
-    const int start = qBound(0, m_lastChangePos, maxPos);
-    const int end = qBound(start, m_lastChangePos + m_lastChangeAdded, maxPos);
+    const int start = m_typographyStale ? 0 : qBound(0, m_lastChangePos, maxPos);
+    const int end = m_typographyStale
+        ? maxPos : qBound(start, m_lastChangePos + m_lastChangeAdded, maxPos);
+    m_typographyStale = false;
+    typesetBlocks(start, end);
+}
 
-    // Blocks that already have it are left alone: an undo brings their format
-    // back with the text, and merging anyway would push a command that clears
-    // the redo stack.
-    bool needed = false;
-    for (QTextBlock block = m_document->findBlock(start);
-         block.isValid() && block.position() <= end; block = block.next()) {
-        const QTextBlockFormat format = block.blockFormat();
-        if (format.lineHeightType() != QTextBlockFormat::ProportionalHeight
-                || format.lineHeight() != typoraLineHeightPercent) {
-            needed = true;
-            break;
-        }
-    }
-    if (!needed)
-        return;
-
+// Joins the formatting onto the edit before it, so a single undo takes back
+// both; with no edit to join, it stays out of the history. Blocks that already
+// have it are left alone, so a pass that changes nothing pushes nothing.
+void Backend::typesetBlocks(int start, int end) {
     m_formattingTypography = true;
     QTextCursor cursor(m_document);
-    cursor.joinPreviousEditBlock();
-    cursor.setPosition(start);
-    cursor.setPosition(end, QTextCursor::KeepAnchor);
-    cursor.mergeBlockFormat(lineHeightFormat());
-    cursor.endEditBlock();
+    bool editing = false;
+    bool unrecorded = false;
+    for (QTextBlock block = m_document->findBlock(start);
+         block.isValid() && block.position() <= end; block = block.next()) {
+        const QTextBlockFormat format = typographyFormat(block);
+        if (hasTypography(block.blockFormat(), format))
+            continue;
+        if (!editing) {
+            unrecorded = m_document->isUndoRedoEnabled() && !m_document->isUndoAvailable();
+            if (unrecorded)
+                m_document->setUndoRedoEnabled(false);
+            cursor.joinPreviousEditBlock();
+            editing = true;
+        }
+        cursor.setPosition(block.position());
+        cursor.mergeBlockFormat(format);
+    }
+    if (editing)
+        cursor.endEditBlock();
+    if (unrecorded)
+        m_document->setUndoRedoEnabled(true);
     m_formattingTypography = false;
 }

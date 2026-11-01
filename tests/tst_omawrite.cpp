@@ -315,6 +315,130 @@ private slots:
         QVERIFY(allLinesSpaced());
     }
 
+    void hangsWrappedListLinesUnderTheirText() {
+        const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
+        QVERIFY(!mainQmlPath.isEmpty());
+
+        Backend backend;
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(mainQmlPath));
+        QVERIFY2(component.isReady(), qPrintable(component.errorString()));
+        QScopedPointer<QObject> object(component.create());
+        auto *window = qobject_cast<QQuickWindow *>(object.data());
+        QVERIFY(window);
+        window->show();
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        QObject *editor = window->findChild<QObject *>(QStringLiteral("sourceEditor"));
+        QVERIFY(editor);
+        auto *quickDocument = qobject_cast<QQuickTextDocument *>(
+            editor->property("textDocument").value<QObject *>());
+        QVERIFY(quickDocument);
+        QTextDocument *document = quickDocument->textDocument();
+
+        // Where a line's second line starts once it wraps, and where its text
+        // starts on its first, past a marker of the given length.
+        const auto wrapsAt = [document](int line) {
+            document->documentLayout()->documentSize();
+            const QTextLayout *layout = document->findBlockByNumber(line).layout();
+            return layout->lineCount() > 1 ? layout->lineAt(1).x() : -1.0;
+        };
+        const auto textStartsAt = [document](int line, int marker) {
+            document->documentLayout()->documentSize();
+            return document->findBlockByNumber(line).layout()->lineAt(0).cursorToX(marker);
+        };
+        // The marker each line opens with once it is an item.
+        const int markers[] = {2, 6, 3, 4, 2};
+        const auto hangsUnderItsText = [&](int line) {
+            return wrapsAt(line) > 0 && wrapsAt(line) == textStartsAt(line, markers[line])
+                && document->findBlockByNumber(line).layout()->lineAt(0).x() == 0;
+        };
+
+        const QString words = QStringLiteral("wraps onto another line ").repeated(12);
+        editor->setProperty("text", QStringList{
+            QStringLiteral("- ") + words,
+            QStringLiteral("    - ") + words,
+            QStringLiteral("\t* ") + words,
+            QStringLiteral("10. ") + words,
+            words,
+            QString(80, QLatin1Char(' ')) + QStringLiteral("- ") + words}.join(QLatin1Char('\n')));
+        for (int line = 0; line < 4; ++line)
+            QVERIFY2(hangsUnderItsText(line), qPrintable(QString::number(line)));
+        QVERIFY(wrapsAt(1) > wrapsAt(0));
+        QCOMPARE(wrapsAt(4), 0.0);
+        // However deep an item nests, its wrapped lines keep most of the width.
+        QVERIFY(wrapsAt(5) > 0 && wrapsAt(5) < document->textWidth() / 2);
+
+        // Taking the marker away takes the hang with it, and a single undo
+        // brings both back without losing redo.
+        QMetaObject::invokeMethod(editor, "forceActiveFocus");
+        QMetaObject::invokeMethod(editor, "select", Q_ARG(int, 0), Q_ARG(int, 2));
+        QTest::keyClick(window, Qt::Key_Delete);
+        QCOMPARE(wrapsAt(0), 0.0);
+        QMetaObject::invokeMethod(editor, "undo");
+        QVERIFY(hangsUnderItsText(0));
+        QVERIFY(document->isRedoAvailable());
+
+        // So does a single key, typed or taken back.
+        const int paragraphStart = document->findBlockByNumber(4).position();
+        editor->setProperty("cursorPosition", paragraphStart);
+        QTest::keyClick(window, '*');
+        QCOMPARE(wrapsAt(4), 0.0);
+        QTest::keyClick(window, ' ');
+        QVERIFY(hangsUnderItsText(4));
+        QCOMPARE(editor->property("cursorPosition").toInt(), paragraphStart + 2);
+        QMetaObject::invokeMethod(editor, "undo");
+        QVERIFY(document->findBlockByNumber(4).text().startsWith(QStringLiteral("*wraps")));
+        QCOMPARE(wrapsAt(4), 0.0);
+        QMetaObject::invokeMethod(editor, "redo");
+        QVERIFY(hangsUnderItsText(4));
+
+        editor->setProperty("cursorPosition", paragraphStart + 2);
+        QTest::keyClick(window, Qt::Key_Backspace);
+        QCOMPARE(wrapsAt(4), 0.0);
+        QCOMPARE(editor->property("cursorPosition").toInt(), paragraphStart + 1);
+        QMetaObject::invokeMethod(editor, "undo");
+        QVERIFY(hangsUnderItsText(4));
+
+        editor->setProperty("cursorPosition", paragraphStart + 1);
+        QTest::keyClick(window, Qt::Key_Delete);
+        QCOMPARE(wrapsAt(4), 0.0);
+        QMetaObject::invokeMethod(editor, "undo");
+        QVERIFY(hangsUnderItsText(4));
+
+        // Markers are measured again in a new font. While redo is possible
+        // that waits for the next edit, rather than clear redo.
+        const qreal smallerHang = wrapsAt(0);
+        QVERIFY(document->isRedoAvailable());
+        backend.setDesktopTextScale(1.5);
+        QVERIFY(document->isRedoAvailable());
+        QCOMPARE(wrapsAt(0), smallerHang);
+        editor->setProperty("cursorPosition", editor->property("length").toInt());
+        QTest::keyClick(window, 'x');
+        QVERIFY(wrapsAt(0) > smallerHang);
+        for (int line = 0; line < 5; ++line)
+            QVERIFY2(hangsUnderItsText(line), qPrintable(QString::number(line)));
+        backend.setDesktopTextScale(1.0);
+        QCOMPARE(wrapsAt(0), smallerHang);
+        QVERIFY(hangsUnderItsText(1));
+
+        // A key beside a letter beyond the Basic Multilingual Plane takes the
+        // whole letter, and Tab after a dash makes an item in one undo step.
+        editor->setProperty("text", QStringLiteral("- done 🎉\n-item"));
+        editor->setProperty("cursorPosition", 9);
+        QTest::keyClick(window, Qt::Key_Backspace);
+        QCOMPARE(document->firstBlock().text(), QStringLiteral("- done "));
+        QMetaObject::invokeMethod(editor, "undo");
+        editor->setProperty("cursorPosition", 7);
+        QTest::keyClick(window, Qt::Key_Delete);
+        QCOMPARE(document->firstBlock().text(), QStringLiteral("- done "));
+        editor->setProperty("cursorPosition", document->lastBlock().position() + 1);
+        QTest::keyClick(window, Qt::Key_Tab);
+        QCOMPARE(document->lastBlock().text(), QStringLiteral("-\titem"));
+        QMetaObject::invokeMethod(editor, "undo");
+        QCOMPARE(document->lastBlock().text(), QStringLiteral("-item"));
+    }
+
     void searchFollowsEditsWithoutTakingTheCaret() {
         const QString mainQmlPath = QFINDTESTDATA("../src/Main.qml");
         QVERIFY(!mainQmlPath.isEmpty());
